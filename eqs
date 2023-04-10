@@ -1,0 +1,495 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Apr 10 18:07:17 2023
+
+@author: d09727
+"""
+
+import pandas as pd
+import datetime as dt
+import scipy.optimize
+import numpy as np
+from datetime import datetime, timedelta
+
+
+Inventaire = pd.read_excel("C:/Users/Pierre/Desktop/Param EQS.xlsx", "Inventaire")
+Indices = pd.read_excel("C:/Users/Pierre/Desktop/Param EQS.xlsx", "Indices")
+df_forecast = pd.read_excel("C:/Users/Pierre/Desktop/Param EQS.xlsx", "Forecast")
+
+sodn1 = pd.read_excel("C:/Users/Pierre/Desktop/SOD311221.xlsx")
+sodn  = pd.read_excel("C:/Users/Pierre/Desktop/SOD_CARDIF_29082022.xlsx")
+Actions = pd.read_excel("C:/Users/Pierre/Desktop/Indices.xlsx", "Actions", header = 3)
+FX = pd.read_excel("C:/Users/Pierre/Desktop/Indices.xlsx", "FX", header = 3)
+
+
+def xnpv(rate, values, dates):
+    '''Equivalent of Excel's XNPV function.'''
+    
+    if rate <= -1.0:
+        return float('inf')
+    d0 = dates[0]    # or min(dates)
+    return sum([ vi / (1.0 + rate)**((di - d0).days / 365.0) for vi, di in zip(values, dates)])
+
+def xirr(values, dates):
+    '''Equivalent of Excel's XIRR function. '''
+
+    try:
+        return scipy.optimize.newton(lambda r: xnpv(r, values, dates), 0.0)
+    except RuntimeError:    # Failed to converge?
+        return scipy.optimize.brentq(lambda r: xnpv(r, values, dates), -1.0, 1e10)
+    
+#dates standard d'upadte paramétrés dans l'exec-paramaters
+std = list(pd.to_datetime(np.transpose(df_forecast['Forecast'])))
+
+valoN1 = sodn1[(sodn1['Product'] == 'Equity swap') 
+            #& (sodn1['Valuation date'] == '31/12/2021')
+            & (sodn1['Book'].isin(['CARDIF ASSURANCE VIE','CARDIF VIE FG']))]\
+            .groupby(['External ref.','VR_TradeCurrency'], as_index = False).agg(Valo_3112N1=('NPV base ccy','sum'))
+
+valoN = sodn[(sodn['Product'] == 'Equity swap') 
+            #& (sodn['Valuation date'] == '29/08/2022')
+            & (sodn['Book'].isin(['CARDIF ASSURANCE VIE','CARDIF VIE FG']))]\
+            .groupby(['External ref.','VR_TradeCurrency'], as_index = False).agg(Valo_N=('NPV base ccy','sum'))
+            
+sod = pd.merge(valoN1, valoN, on = ['External ref.','VR_TradeCurrency'], how = 'outer')
+sod = pd.merge(sod, Inventaire[['Référence','Nominal','Echeance']], left_on = ['External ref.'], right_on = ['Référence'])
+del sod['Référence']
+
+
+
+for date in std:
+    sod[date.strftime('%d-%m-%Y')] = np.where(sod['Echeance'] > date,
+            np.where(sod['VR_TradeCurrency'] == 'EUR',
+                sod['Valo_N']+sod['Nominal']*(1-Indices['Eurostoxx50'].loc[Indices['Dates'] == date].iloc[0]/
+                        Actions['EuroStoxx 50'].loc[Actions['Unnamed: 0'] == sodn['Valuation date'].drop_duplicates()[0]].iloc[0]),
+                sod['Valo_N']+sod['Nominal']*(1-Indices['S&P 500'].loc[Indices['Dates'] == date].iloc[0]/
+                        Actions['S&P 500'].loc[Actions['Unnamed: 0'] == sodn['Valuation date'].drop_duplicates()[0]].iloc[0])),
+                0
+                )
+    
+sod_pnl_dev = sod.rename(columns={'Echeance': sodn['Valuation date'].drop_duplicates()[0].strftime('%d-%m-%Y'),
+                              'External ref.' : 'Réeval',
+                              'VR_TradeCurrency' :  'Devise'})
+sod_pnl_dev[sodn['Valuation date'].drop_duplicates()[0].strftime('%d-%m-%Y')] = sod_pnl_dev['Valo_N']-sod_pnl_dev['Valo_3112N1']
+                                                                                    
+for date in std:
+    sod_pnl_dev[date.strftime('%d-%m-%Y')] = sod_pnl_dev[date.strftime('%d-%m-%Y')]-sod_pnl_dev['Valo_3112N1']
+    
+del sod_pnl_dev['Valo_3112N1']
+del sod_pnl_dev['Valo_N']
+del sod_pnl_dev['Nominal']
+del sod_pnl_dev[sodn['Valuation date'].drop_duplicates()[0].strftime('%d-%m-%Y')]
+sod_pnl_dev = sod_pnl_dev.sort_values(by='Réeval')
+
+
+
+sod_pnl_eur = sod.rename(columns={'Echeance': sodn['Valuation date'].drop_duplicates()[0].strftime('%d-%m-%Y'),
+                              'External ref.' : 'Réeval',
+                              'VR_TradeCurrency' :  'Devise'})
+sod_pnl_eur[sodn['Valuation date'].drop_duplicates()[0].strftime('%d-%m-%Y')] = np.where(
+    sod_pnl_eur['Devise'] == 'USD', (sod_pnl_eur['Valo_N']-sod_pnl_eur['Valo_3112N1'])/FX['USD'].loc[Actions['Unnamed: 0'] == sodn['Valuation date'].drop_duplicates()[0]].iloc[0],
+    sod_pnl_eur['Valo_N']-sod_pnl_eur['Valo_3112N1']
+                                                                                    )
+for date in std:
+    sod_pnl_eur[date.strftime('%d-%m-%Y')] = np.where(
+        sod_pnl_eur['Devise'] == 'USD', (sod_pnl_eur[date.strftime('%d-%m-%Y')]-sod_pnl_eur['Valo_3112N1'])/Indices['EURUSD'].loc[Indices['Dates'] == date].iloc[0],
+                #FX[fxp2].loc[Actions[fxm1] == sodn['Valuation date'].drop_duplicates()[0]].iloc[0],
+        sod_pnl_eur[date.strftime('%d-%m-%Y')]-sod_pnl_eur['Valo_3112N1']
+                                                     )
+del sod_pnl_eur['Valo_3112N1']
+del sod_pnl_eur['Valo_N']
+del sod_pnl_eur['Nominal']
+del sod_pnl_eur[sodn['Valuation date'].drop_duplicates()[0].strftime('%d-%m-%Y')]
+sod_pnl_eur = sod_pnl_eur.sort_values(by='Réeval')
+
+
+
+
+list_of_dfs = list()
+
+i = 0
+j = 0
+k = 0
+l = 0
+m = 0
+
+Référence = list(np.transpose(Inventaire['Référence'].values))
+
+Etlmt = pd.DataFrame(columns = ['Etalement', 'Devise', std[0].strftime('%d-%m-%Y'),std[1].strftime('%d-%m-%Y'),
+                                                       std[2].strftime('%d-%m-%Y'),std[3].strftime('%d-%m-%Y'),
+                                                       std[4].strftime('%d-%m-%Y')])
+
+Tri =   pd.DataFrame(columns = ['Tri',       'Devise', std[0].strftime('%d-%m-%Y'),std[1].strftime('%d-%m-%Y'),
+                                                       std[2].strftime('%d-%m-%Y'),std[3].strftime('%d-%m-%Y'),
+                                                       std[4].strftime('%d-%m-%Y')])
+
+Flux =  pd.DataFrame(columns = ['Flux',      'Devise', std[0].strftime('%d-%m-%Y'),std[1].strftime('%d-%m-%Y'),
+                                                       std[2].strftime('%d-%m-%Y'),std[3].strftime('%d-%m-%Y'),
+                                                       std[4].strftime('%d-%m-%Y')])
+
+writer = pd.ExcelWriter('C:/Users/Pierre/Desktop/Export.xlsx', 
+                        engine='xlsxwriter')#,
+                        #date_format='YYYY-MM-DD')
+for ref in Référence:
+        
+    #génère la liste des dates des flux
+    daterange0 = list(pd.to_datetime((np.transpose(Inventaire.loc[Inventaire['Référence'] == ref].iloc[:,12:] \
+                                    .dropna(axis=1)).iloc[:,0])))
+    
+    daterange0 = [x for x in daterange0 if x.year >= std[0].year]
+    
+    daterange = []
+    for date in daterange0:
+        if date == min(daterange0) and date.year < 2024  :
+            ajout = dt.date(date.year-1, 12, 31)       
+            # getting difference
+            diff = 2
+            if ajout.weekday() == 0:
+                diff = 4
+            elif ajout.weekday() == 1:
+                diff = 4
+            else :
+                diff = 2
+            ajout = ajout - timedelta(days=diff)
+            daterange.append(ajout)
+            daterange.append(date)
+
+        elif date == min(daterange0) and date.year >= 2024  :
+            ajout = dt.date(date.year-1, 12, 31)       
+            # getting difference
+            diff = 3
+            if ajout.weekday() == 0:
+                diff = 5
+            elif ajout.weekday() == 1:
+                diff = 5
+            else :
+                diff = 3
+            ajout = ajout - timedelta(days=diff)
+            daterange.append(ajout)
+            daterange.append(date)
+        else:
+            daterange.append(date)
+
+    daterange = list(pd.to_datetime(daterange))
+
+    #ajout de dates en complément de ce qui est demandé à l'Upd pou projeter l'EQS sur sa durée de vie totale
+    
+    date_trans = []
+    for date in daterange:
+        if (date.year > max(std).year and date.year < max(daterange).year):
+            temp = dt.date(date.year, 12, 31)
+            
+            diff = 2
+            if temp.weekday() == 0:
+                diff = 4
+            elif temp.weekday() == 1:
+                diff = 4
+            else :
+                diff = 2
+            temp2 = temp - timedelta(days=diff)
+            date_trans.append(temp2)
+        
+    Forecast = sorted(std + list(pd.to_datetime(date_trans)) + [max(daterange)])
+    
+    Forecast2 = []
+    for date in Forecast:
+        temp = datetime.strftime(date, '%d/%m/%Y')
+        Forecast2.append(temp)
+        
+    date_technique = []
+    appended_df = []
+    calc = []
+    inv_r = Inventaire.loc[Inventaire['Référence'] == ref]
+    
+    tri = []
+    etalement = []
+    flux1 = []
+    flux2 = []
+       
+    for date in Forecast:
+        
+        date_technique.append(date)
+        
+        #gestion des indices et des dividendes attendus
+        
+        if inv_r.iloc[0]['Indice'] == 'Eurostoxx50':
+            Param = Indices[['Dates', 'DEDZ', 'Eurostoxx50']]. \
+            loc[Indices['Dates'] == min(list(pd.to_datetime(np.transpose(Indices['Dates'].\
+                                        values.astype('datetime64[D]')))), \
+                                        key=lambda sub: abs(sub - date))]
+            Param['Taux'] = Param['DEDZ']/inv_r['Niveau0'].iloc[0]
+
+        if inv_r.iloc[0]['Indice'] == 'S&P 500':
+            Param = Indices[['Dates', 'SDAZ', 'S&P 500']]. \
+            loc[Indices['Dates'] == min(list(pd.to_datetime(np.transpose(Indices['Dates'].\
+                                        values.astype('datetime64[D]')))), \
+                                        key=lambda sub: abs(sub - date))]
+            Param['Taux'] = Param['SDAZ']/inv_r['Niveau0'].iloc[0]
+            
+        if date.year == date_technique[0].year:          
+
+            df = pd.DataFrame({'date': pd.to_datetime(daterange).sort_values()})
+            
+            if np.isnan(inv_r.iloc[0]['Mtt_Flux1']) and np.isnan(inv_r.iloc[0]['Mtt_Flux2']):
+                
+                df['montant'] = [-inv_r.iloc[0]['Nominal']+inv_r.iloc[0]['Prime'] if s == daterange[0] #inv_r['Flux1'].iloc[0]
+                                    else inv_r.iloc[0]['Nominal']\
+                                            +inv_r.iloc[0]['Nominal']*(1-Param.iloc[0][2]/inv_r['Niveau0'].iloc[0])\
+                                            +inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux']\
+                                        if s == inv_r['Echeance'].iloc[0] 
+                                    else inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux'] 
+                                 for s in df['date']
+                                ]                
+                                                      
+            else:
+                df['montant'] = [inv_r.iloc[0]['Mtt_Flux1'] if s ==  daterange[0] #inv_r['Flux1'].iloc[0]
+                                    else inv_r.iloc[0]['Mtt_Flux2'] if s == daterange[1] #inv_r['Flux2'].iloc[0]
+                                    else inv_r.iloc[0]['Nominal']\
+                                            +inv_r.iloc[0]['Nominal']*(1-Param.iloc[0][2]/inv_r['Niveau0'].iloc[0])\
+                                            +inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux']\
+                                        if s == inv_r['Echeance'].iloc[0] 
+                                    else inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux'] 
+                                 for s in df['date']
+                                ] 
+
+        if date.year == date_technique[0].year + 1:
+
+            daterange2 = [x for x in daterange if date.year <= x.year]
+            daterange2.append(date_technique[-2])
+            daterange2.sort()
+                                   
+            df = pd.DataFrame({'date': pd.to_datetime(daterange2).sort_values()})
+            
+            df['montant'] = [-etalement[-1]+flux1[-1] if s == df['date'][0]  
+                                else inv_r.iloc[0]['Nominal']\
+                                        +inv_r.iloc[0]['Nominal']*(1-Param.iloc[0][2]/inv_r['Niveau0'].iloc[0])\
+                                        +inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux']\
+                                    if s == inv_r['Echeance'].iloc[0] 
+                                else inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux'] 
+                             for s in df['date']
+                            ] 
+            
+        if date.year > date_technique[0].year + 1:
+
+            daterange2 = [x for x in daterange if date.year <= x.year]
+            daterange2.append(date_technique[-2])
+            daterange2.sort()
+                                   
+            df = pd.DataFrame({'date': pd.to_datetime(daterange2).sort_values()})
+            
+            df['montant'] = [-etalement[-1]+flux1[-1]+flux2[-1] if s == df['date'][0]  
+                                else inv_r.iloc[0]['Nominal']\
+                                        +inv_r.iloc[0]['Nominal']*(1-Param.iloc[0][2]/inv_r['Niveau0'].iloc[0])\
+                                        +inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux']\
+                                    if s == inv_r['Echeance'].iloc[0] 
+                                else inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux'] 
+                             for s in df['date']
+                            ] 
+       
+        appended_df.append(df) 
+        calc.append(Param['Taux'].reset_index(drop=True))
+        flux1.append(df['montant'][0])
+        flux2.append(inv_r.iloc[0]['Rém-Fixe']*inv_r.iloc[0]['Nominal']-inv_r.iloc[0]['Nominal']*Param.iloc[0]['Taux'])
+        tri.append(xirr(df['montant'],df['date']))
+               
+        etalement.append(-df['montant'][0]*((1+xirr(df['montant'],df['date']))**((date-df['date'][0]).days/365)-1))
+       
+        list_of_dfs.append(df)
+        df_concat = pd.concat(appended_df, axis = 1, keys = Forecast2 )
+        #df_tri = pd.concat(tri, axis = 1,  keys = Forecast2)
+            
+        calc_concat = pd.concat(calc, axis = 1)
+
+    #Concaténation de l'étalement des tri et des flux de l'année pour l'ensemble des EQS sur les dates d'update
+    
+    lst_etlmt = [[ref, inv_r['Devise'].iloc[0], etalement[0],etalement[1],etalement[2],etalement[3],etalement[4]]]
+    lst_tri   = [[ref, inv_r['Devise'].iloc[0], tri[0],tri[1],tri[2],tri[3],tri[4]]]
+    lst_flux  = [[ref, inv_r['Devise'].iloc[0], flux2[0],flux2[1],flux2[2],flux2[3],flux2[4]]]
+    
+    Etlmt0 = pd.DataFrame(lst_etlmt, columns = ['Etalement', 'Devise', 
+                                                             std[0].strftime('%d-%m-%Y'),std[1].strftime('%d-%m-%Y'),
+                                                             std[2].strftime('%d-%m-%Y'),std[3].strftime('%d-%m-%Y'),
+                                                             std[4].strftime('%d-%m-%Y')])
+    
+    Tri0   = pd.DataFrame(lst_tri,   columns = ['Tri',       'Devise',
+                                                             std[0].strftime('%d-%m-%Y'),std[1].strftime('%d-%m-%Y'),
+                                                             std[2].strftime('%d-%m-%Y'),std[3].strftime('%d-%m-%Y'),
+                                                             std[4].strftime('%d-%m-%Y')])
+
+    Flux0  = pd.DataFrame(lst_flux,  columns = ['Flux',      'Devise',
+                                                             std[0].strftime('%d-%m-%Y'),std[1].strftime('%d-%m-%Y'),
+                                                             std[2].strftime('%d-%m-%Y'),std[3].strftime('%d-%m-%Y'),
+                                                             std[4].strftime('%d-%m-%Y')])
+
+    Etlmt = pd.concat([Etlmt,Etlmt0])
+    Tri = pd.concat([Tri,Tri0]).sort_values(by='Tri')
+    Flux = pd.concat([Flux,Flux0])      
+        
+    Etlmt_dev = Etlmt.sort_values(by='Etalement')
+    Flux_dev = Flux.sort_values(by='Flux')
+
+    Etlmt_eur = Etlmt.sort_values(by='Etalement')
+    Flux_eur = Flux.sort_values(by='Flux')
+
+    #gestion des exports
+
+    #Etlmt_eur.to_excel(writer,sheet_name='Synthèse_EUR',startrow=0 , startcol=0)  
+    sod_pnl_eur.to_excel(writer,sheet_name='Synthèse_EUR',startrow=29 , startcol=0)
+    #Flux_eur.to_excel(writer,sheet_name='Synthèse_EUR',startrow=0 , startcol=9)
+    Tri.to_excel(writer,sheet_name='Synthèse_EUR',startrow=0 , startcol=18)
+
+    Etlmt_dev.to_excel(writer,sheet_name='Synthèse_DEV',startrow=0 , startcol=0)  
+    sod_pnl_dev.to_excel(writer,sheet_name='Synthèse_DEV',startrow=29 , startcol=0)
+    Flux_dev.to_excel(writer,sheet_name='Synthèse_DEV',startrow=0 , startcol=9)
+    Tri.to_excel(writer,sheet_name='Synthèse_DEV',startrow=0 , startcol=18)
+
+
+    if inv_r['Contrepartie'].iloc[0] == 'BNP SE5X':
+        df_concat.to_excel(writer, sheet_name=inv_r['Contrepartie'].iloc[0],startrow=i+2 , startcol=0)
+        worksheet = writer.sheets[inv_r['Contrepartie'].iloc[0]]
+        worksheet.write(i, 1, ref)
+        i = i + 15
+    
+    if inv_r['Contrepartie'].iloc[0] == 'Natixis SE5X':
+        df_concat.to_excel(writer, sheet_name=inv_r['Contrepartie'].iloc[0],startrow=j+2 , startcol=0)
+        worksheet = writer.sheets[inv_r['Contrepartie'].iloc[0]]
+        worksheet.write(j, 1, ref)
+        j = j + 15
+        
+    if inv_r['Contrepartie'].iloc[0] == 'BOFA SE5X':
+        df_concat.to_excel(writer, sheet_name=inv_r['Contrepartie'].iloc[0],startrow=k+2 , startcol=0)
+        worksheet = writer.sheets[inv_r['Contrepartie'].iloc[0]]
+        worksheet.write(k, 1, ref)
+        k = k + 15
+        
+    if inv_r['Contrepartie'].iloc[0] == 'BNP S&P':
+        df_concat.to_excel(writer, sheet_name=inv_r['Contrepartie'].iloc[0],startrow=l+2 , startcol=0)
+        worksheet = writer.sheets[inv_r['Contrepartie'].iloc[0]]
+        worksheet.write(l, 1, ref)
+        l = l + 15
+        
+    if inv_r['Contrepartie'].iloc[0] == 'SG S&P':
+        df_concat.to_excel(writer, sheet_name=inv_r['Contrepartie'].iloc[0],startrow=m+2 , startcol=0)
+        worksheet = writer.sheets[inv_r['Contrepartie'].iloc[0]]
+        worksheet.write(m, 1, ref)
+        m = m + 15
+
+
+for date in std:
+    Etlmt_eur[date.strftime('%d-%m-%Y')] = np.where(
+        Etlmt_eur['Devise'] == 'USD', 
+        Etlmt_eur[date.strftime('%d-%m-%Y')]/Indices['EURUSD'].loc[Indices['Dates'] == date].iloc[0],
+                #FX[fxp2].loc[Actions[fxm1] == sodn['Valuation date'].drop_duplicates()[0]].iloc[0],
+        Etlmt_eur[date.strftime('%d-%m-%Y')]
+                                                    )
+    Flux_eur[date.strftime('%d-%m-%Y')] = np.where(
+        Flux_eur['Devise'] == 'USD', 
+        Flux_eur[date.strftime('%d-%m-%Y')]/Indices['EURUSD'].loc[Indices['Dates'] == date].iloc[0],
+                #FX[fxp2].loc[Actions[fxm1] == sodn['Valuation date'].drop_duplicates()[0]].iloc[0],
+        Flux_eur[date.strftime('%d-%m-%Y')]
+                                                    )
+rifrs_dev = pd.merge(Etlmt_dev, Flux_dev, left_on = ['Etalement'], right_on = ['Flux'])
+rifrs_dev = pd.merge(rifrs_dev, sod_pnl_dev, left_on = ['Etalement'], right_on = ['Réeval'])
+
+for date in std:
+    rifrs_dev[date.strftime('%d-%m-%Y')] = rifrs_dev[date.strftime('%d-%m-%Y')]\
+                                          +rifrs_dev[date.strftime('%d-%m-%Y')+'_y']\
+                                          -rifrs_dev[date.strftime('%d-%m-%Y')+'_x']
+del rifrs_dev[std[0].strftime('%d-%m-%Y')+'_x']
+del rifrs_dev[std[1].strftime('%d-%m-%Y')+'_x']
+del rifrs_dev[std[2].strftime('%d-%m-%Y')+'_x']
+del rifrs_dev[std[3].strftime('%d-%m-%Y')+'_x']
+del rifrs_dev[std[4].strftime('%d-%m-%Y')+'_x']
+del rifrs_dev[std[0].strftime('%d-%m-%Y')+'_y']
+del rifrs_dev[std[1].strftime('%d-%m-%Y')+'_y']
+del rifrs_dev[std[2].strftime('%d-%m-%Y')+'_y']
+del rifrs_dev[std[3].strftime('%d-%m-%Y')+'_y']
+del rifrs_dev[std[4].strftime('%d-%m-%Y')+'_y']
+del rifrs_dev['Devise'+'_x']
+del rifrs_dev['Devise'+'_y']
+del rifrs_dev['Flux']
+del rifrs_dev['Réeval']
+rifrs_dev = rifrs_dev.rename(columns={'Etalement': 'RIFRS'})
+rifrs_dev = rifrs_dev.sort_values(by = 'RIFRS')
+
+rifrs_eur = pd.merge(Etlmt_eur, Flux_eur, left_on = ['Etalement'], right_on = ['Flux'])
+rifrs_eur = pd.merge(rifrs_eur, sod_pnl_eur, left_on = ['Etalement'], right_on = ['Réeval'])
+
+for date in std:
+    rifrs_eur[date.strftime('%d-%m-%Y')] = rifrs_eur[date.strftime('%d-%m-%Y')]\
+                                          +rifrs_eur[date.strftime('%d-%m-%Y')+'_y']\
+                                          -rifrs_eur[date.strftime('%d-%m-%Y')+'_x']
+del rifrs_eur[std[0].strftime('%d-%m-%Y')+'_x']
+del rifrs_eur[std[1].strftime('%d-%m-%Y')+'_x']
+del rifrs_eur[std[2].strftime('%d-%m-%Y')+'_x']
+del rifrs_eur[std[3].strftime('%d-%m-%Y')+'_x']
+del rifrs_eur[std[4].strftime('%d-%m-%Y')+'_x']
+del rifrs_eur[std[0].strftime('%d-%m-%Y')+'_y']
+del rifrs_eur[std[1].strftime('%d-%m-%Y')+'_y']
+del rifrs_eur[std[2].strftime('%d-%m-%Y')+'_y']
+del rifrs_eur[std[3].strftime('%d-%m-%Y')+'_y']
+del rifrs_eur[std[4].strftime('%d-%m-%Y')+'_y']
+del rifrs_eur['Devise'+'_x']
+del rifrs_eur['Devise'+'_y']
+del rifrs_eur['Flux']
+del rifrs_eur['Réeval']
+rifrs_eur = rifrs_eur.rename(columns={'Etalement': 'RIFRS'})
+rifrs_eur = rifrs_eur.sort_values(by = 'RIFRS')
+
+rifrs_dev.to_excel(writer,sheet_name='Synthèse_DEV',startrow=29 , startcol=9)  
+
+Etlmt_eur.to_excel(writer,sheet_name='Synthèse_EUR',startrow=0 , startcol=0)  
+Flux_eur.to_excel(writer,sheet_name='Synthèse_EUR',startrow=0 , startcol=9)
+rifrs_eur.to_excel(writer,sheet_name='Synthèse_EUR',startrow=29 , startcol=9)
+
+workbook  = writer.book
+format1 = workbook.add_format({'num_format': 'dd/mm/yy'})
+format2 = workbook.add_format({'num_format': '#,##'})
+format3 = workbook.add_format({'num_format': '0.000%'})
+
+for x in ['Synthèse_EUR','Synthèse_DEV']:
+    worksheet = writer.sheets[x]
+    worksheet.set_column('A:A', 0)
+    worksheet.set_column('B:B', 13)
+    worksheet.set_column('C:C', 7)
+    worksheet.set_column('D:H', 13, format2)
+
+    worksheet.set_column('J:J', 0)
+    worksheet.set_column('K:K', 13)
+    worksheet.set_column('L:L', 7)
+    worksheet.set_column('M:Q', 13, format2)
+
+    worksheet.set_column('S:S', 0)
+    worksheet.set_column('T:T', 13)
+    worksheet.set_column('U:U', 7)
+    worksheet.set_column('V:Z', 13, format3)
+
+for x in list(Inventaire['Contrepartie'].drop_duplicates()):
+    worksheet = writer.sheets[x]
+    worksheet.set_column('A:A', 0)
+    worksheet.set_column('B:B', 18, format1)
+    worksheet.set_column('D:D', 18, format1)
+    worksheet.set_column('F:F', 18, format1)
+    worksheet.set_column('H:H', 18, format1)
+    worksheet.set_column('J:J', 18, format1)
+    worksheet.set_column('L:L', 18, format1)
+    worksheet.set_column('N:N', 18, format1)
+    worksheet.set_column('P:P', 18, format1)
+    worksheet.set_column('R:R', 18, format1)
+    worksheet.set_column('T:T', 18, format1)
+    worksheet.set_column('V:V', 18, format1)
+
+    worksheet.set_column('C:C', 13, format2)
+    worksheet.set_column('E:E', 13, format2)
+    worksheet.set_column('G:G', 13, format2)
+    worksheet.set_column('I:I', 13, format2)
+    worksheet.set_column('K:K', 13, format2)
+    worksheet.set_column('M:M', 13, format2)
+    worksheet.set_column('O:O', 13, format2)
+    worksheet.set_column('Q:Q', 13, format2)
+    worksheet.set_column('S:S', 13, format2)
+    worksheet.set_column('U:U', 13, format2)
+    worksheet.set_column('W:W', 13, format2)
+
+writer.save()
+writer.close()
